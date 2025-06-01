@@ -1,0 +1,62 @@
+{
+  "name": "whatsapp-expense-tracker",
+  "services": [
+    {
+      "name": "whatsapp-bot",
+      "type": "git",
+      "source": {
+        "type": "github",
+        "url": "your-github-repo-url"
+      },
+      "build": {
+        "dockerfile": "Dockerfile"
+      },
+      "environment": {
+        "PORT": "8080",
+        "N8N_WEBHOOK_URL": "${N8N_WEBHOOK_URL}",
+        "LLM_PROVIDER": "${LLM_PROVIDER}",
+        "LLM_API_KEY": "${LLM_API_KEY}",
+        "WHATSAPP_SESSION_PATH": "/tmp/whatsapp-session"
+      },
+      "ports": [
+        {
+          "port": 8080,
+          "type": "http"
+        }
+      ],
+      "volumes": [
+        {
+          "name": "whatsapp-session",
+          "mountPath": "/tmp/whatsapp-session"
+        }
+      ]
+    },
+    {
+      "name": "n8n",
+      "type": "prebuilt",
+      "image": "n8nio/n8n:latest",
+      "environment": {
+        "N8N_BASIC_AUTH_ACTIVE": "true",
+        "N8N_BASIC_AUTH_USER": "admin",
+        "N8N_BASIC_AUTH_PASSWORD": "${N8N_PASSWORD}",
+        "WEBHOOK_URL": "https://${ZEABUR_DOMAIN}",
+        "N8N_HOST": "0.0.0.0",
+        "N8N_PORT": "5678",
+        "N8N_PROTOCOL": "https",
+        "NODE_ENV": "production"
+      },
+      "ports": [
+        {
+          "port": 5678,
+          "type": "http"
+        }
+      ],
+      "volumes": [
+        {
+          "name": "n8n-data",
+          "mountPath": "/home/node/.n8n"
+        }
+      ]
+    }
+  ]
+}

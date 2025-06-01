@@ -1,0 +1,269 @@
+{
+    "name": "WhatsApp Expense Tracker",
+    "nodes": [
+      {
+        "id": "webhook",
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 1,
+        "position": [240, 300],
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "whatsapp-expense",
+          "responseMode": "responseNode",
+          "options": {}
+        }
+      },
+      {
+        "id": "validate-data",
+        "name": "Validate Data",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [460, 300],
+        "parameters": {
+          "functionCode": "// Validate incoming expense data\nconst data = items[0].json;\n\n// Check required fields\nconst requiredFields = ['item', 'amount', 'group_name', 'sender_name', 'timestamp'];\nfor (const field of requiredFields) {\n  if (!data[field]) {\n    throw new Error(`Missing required field: ${field}`);\n  }\n}\n\n// Clean and format data\nconst cleanedData = {\n  item: data.item.trim(),\n  amount: parseFloat(data.amount),\n  category: data.category || 'Uncategorized',\n  group_name: data.group_name.trim(),\n  sender_name: data.sender_name.trim(),\n  sender_phone: data.sender_phone || '',\n  timestamp: new Date(data.timestamp).toISOString(),\n  message_id: data.message_id || '',\n  formatted_amount: new Intl.NumberFormat('id-ID', {\n    style: 'currency',\n    currency: 'IDR',\n    minimumFractionDigits: 0\n  }).format(data.amount)\n};\n\n// Generate spreadsheet name based on group name\ncleanedData.spreadsheet_name = data.group_name\n  .toLowerCase()\n  .replace(/[^a-z0-9\\s]/g, '')\n  .replace(/\\s+/g, '-')\n  + '-expenses';\n\nreturn [cleanedData];"
+        }
+      },
+      {
+        "id": "check-spreadsheet",
+        "name": "Check if Spreadsheet Exists",
+        "type": "n8n-nodes-base.googleSheets",
+        "typeVersion": 4,
+        "position": [680, 300],
+        "parameters": {
+          "operation": "appendOrUpdate",
+          "documentId": {
+            "__rl": true,
+            "mode": "url",
+            "value": "={{ $json.spreadsheet_name }}"
+          },
+          "sheetName": "Expenses",
+          "columnToMatchOn": "A",
+          "valueToMatchOn": "={{ $json.message_id }}",
+          "options": {
+            "continue": true
+          }
+        },
+        "continueOnFail": true
+      },
+      {
+        "id": "create-spreadsheet",
+        "name": "Create New Spreadsheet",
+        "type": "n8n-nodes-base.googleSheets",
+        "typeVersion": 4,
+        "position": [680, 480],
+        "parameters": {
+          "operation": "create",
+          "title": "={{ $json.spreadsheet_name }}",
+          "sheetsUi": {
+            "sheetValues": [
+              {
+                "sheetName": "Expenses",
+                "headerRow": true
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "setup-headers",
+        "name": "Setup Headers",
+        "type": "n8n-nodes-base.googleSheets",
+        "typeVersion": 4,
+        "position": [900, 480],
+        "parameters": {
+          "operation": "update",
+          "documentId": "={{ $json.spreadsheetId }}",
+          "sheetName": "Expenses",
+          "range": "A1:H1",
+          "options": {
+            "valueInputOption": "USER_ENTERED",
+            "valueRenderOption": "FORMATTED_VALUE"
+          },
+          "dataMode": "define",
+          "fieldsUi": {
+            "values": [
+              {
+                "row": [
+                  "Timestamp",
+                  "Item",
+                  "Amount (IDR)",
+                  "Category",
+                  "Sender",
+                  "Phone",
+                  "Group",
+                  "Message ID"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "add-expense",
+        "name": "Add Expense to Sheet",
+        "type": "n8n-nodes-base.googleSheets",
+        "typeVersion": 4,
+        "position": [1120, 300],
+        "parameters": {
+          "operation": "append",
+          "documentId": "={{ $('check-spreadsheet').item.json.spreadsheetId || $('setup-headers').item.json.spreadsheetId }}",
+          "sheetName": "Expenses",
+          "options": {
+            "valueInputOption": "USER_ENTERED"
+          },
+          "dataMode": "define",
+          "fieldsUi": {
+            "values": [
+              {
+                "row": [
+                  "={{ $json.timestamp }}",
+                  "={{ $json.item }}",
+                  "={{ $json.amount }}",
+                  "={{ $json.category }}",
+                  "={{ $json.sender_name }}",
+                  "={{ $json.sender_phone }}",
+                  "={{ $json.group_name }}",
+                  "={{ $json.message_id }}"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "success-response",
+        "name": "Success Response",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [1340, 300],
+        "parameters": {
+          "options": {
+            "responseCode": 200
+          },
+          "respondWith": "json",
+          "responseBody": "={{ { \"status\": \"success\", \"message\": \"Expense recorded successfully\", \"data\": $json } }}"
+        }
+      },
+      {
+        "id": "error-response",
+        "name": "Error Response",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [680, 120],
+        "parameters": {
+          "options": {
+            "responseCode": 400
+          },
+          "respondWith": "json",
+          "responseBody": "={{ { \"status\": \"error\", \"message\": $json.error || \"Failed to process expense\" } }}"
+        }
+      },
+      {
+        "id": "duplicate-check",
+        "name": "Check for Duplicates",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 1,
+        "position": [900, 300],
+        "parameters": {
+          "functionCode": "// Check if the expense already exists (duplicate prevention)\nconst currentData = items[0].json;\nconst existingData = $('check-spreadsheet').all();\n\n// If we found existing data with the same message_id, it's a duplicate\nif (existingData.length > 0 && existingData[0].json.values) {\n  const rows = existingData[0].json.values;\n  for (const row of rows) {\n    if (row[7] === currentData.message_id) { // Message ID is in column H (index 7)\n      throw new Error('Duplicate expense detected');\n    }\n  }\n}\n\nreturn items;"
+        }
+      }
+    ],
+    "connections": {
+      "webhook": {
+        "main": [
+          [
+            {
+              "node": "validate-data",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "validate-data": {
+        "main": [
+          [
+            {
+              "node": "check-spreadsheet",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "check-spreadsheet": {
+        "main": [
+          [
+            {
+              "node": "duplicate-check",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "create-spreadsheet",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "create-spreadsheet": {
+        "main": [
+          [
+            {
+              "node": "setup-headers",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "setup-headers": {
+        "main": [
+          [
+            {
+              "node": "add-expense",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "duplicate-check": {
+        "main": [
+          [
+            {
+              "node": "add-expense",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "add-expense": {
+        "main": [
+          [
+            {
+              "node": "success-response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "errorWorkflow": {
+        "callerPolicy": "workflowSettings"
+      }
+    },
+    "staticData": null,
+    "tags": [],
+    "triggerCount": 0,
+    "updatedAt": "2025-06-01T00:00:00.000Z",
+    "versionId": "1"
+  }
