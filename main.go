@@ -13,11 +13,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/internal/rest"
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/whatsapp"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+
+	_ "github.com/mattn/go-sqlite3"
+	"google.golang.org/protobuf/proto"
 )
 
 type ExpenseData struct {
@@ -32,6 +36,7 @@ type ExpenseData struct {
 }
 
 var (
+	client        *whatsmeow.Client
 	n8nWebhookURL = os.Getenv("N8N_WEBHOOK_URL")
 	llmProvider   = os.Getenv("LLM_PROVIDER")
 	llmAPIKey     = os.Getenv("LLM_API_KEY")
@@ -40,7 +45,7 @@ var (
 	expenseRegex  = regexp.MustCompile(`^(.+?)\s+(\d+(?:[.,]\d{3})*(?:[.,]\d{2})?)$`)
 	commandRegex  = regexp.MustCompile(`^/(summary|categories|help|status)\s*(.*)$`)
 	
-	// Common categories for quick matching (to reduce LLM calls)
+	// Common categories for quick matching
 	categoryKeywords = map[string]string{
 		"food": "Food", "makan": "Food", "nasi": "Food", "ayam": "Food", "sate": "Food",
 		"transport": "Transportation", "grab": "Transportation", "gojek": "Transportation", "taxi": "Transportation",
@@ -51,18 +56,13 @@ var (
 )
 
 func main() {
-	cfg := config.LoadConfig()
-	whatsappClient := whatsapp.NewWhatsAppClient(cfg)
-	
-	whatsappClient.WaClient.AddEventHandler(handleMessage)
-	
-	restAPI := rest.NewRestAPI(whatsappClient)
-	
-	// Add health check endpoint
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy","timestamp":"` + time.Now().ISO8601() + `"}`))
-	})
+	// Initialize WhatsApp client
+	if err := initWhatsApp(); err != nil {
+		log.Fatal("❌ Failed to initialize WhatsApp:", err)
+	}
+
+	// Setup HTTP server
+	setupHTTPServer()
 	
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -73,15 +73,94 @@ func main() {
 	log.Printf("📡 N8N Webhook: %s", maskURL(n8nWebhookURL))
 	log.Printf("🤖 LLM Provider: %s", llmProvider)
 	
-	if err := http.ListenAndServe(":"+port, restAPI.Router); err != nil {
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal("❌ Failed to start server:", err)
 	}
+}
+
+func initWhatsApp() error {
+	dbLog := waLog.Stdout("Database", "INFO", true)
+	container, err := sqlstore.New("sqlite3", "file:whatsapp.db?_foreign_keys=on", dbLog)
+	if err != nil {
+		return fmt.Errorf("failed to create database: %v", err)
+	}
+
+	deviceStore, err := container.GetFirstDevice()
+	if err != nil {
+		return fmt.Errorf("failed to get device: %v", err)
+	}
+
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	client = whatsmeow.NewClient(deviceStore, clientLog)
+	
+	// Add event handler
+	client.AddEventHandler(handleMessage)
+
+	// Connect to WhatsApp
+	if client.Store.ID == nil {
+		// No existing session, need to pair
+		qrChan, _ := client.GetQRChannel(context.Background())
+		err = client.Connect()
+		if err != nil {
+			return fmt.Errorf("failed to connect: %v", err)
+		}
+
+		// Wait for QR code
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				log.Printf("🔗 QR Code: %s", evt.Code)
+				log.Println("📱 Scan this QR code with your WhatsApp mobile app")
+			} else {
+				log.Printf("📱 Login event: %s", evt.Event)
+				if evt.Event == "success" {
+					break
+				}
+			}
+		}
+	} else {
+		// Existing session, just connect
+		err = client.Connect()
+		if err != nil {
+			return fmt.Errorf("failed to connect: %v", err)
+		}
+	}
+
+	log.Println("✅ WhatsApp connected successfully!")
+	return nil
+}
+
+func setupHTTPServer() {
+	// Health check endpoint
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "healthy",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	})
+
+	// QR Code endpoint for pairing
+	http.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
+		if client.Store.ID != nil {
+			w.Write([]byte("Already logged in"))
+			return
+		}
+		
+		qrChan, _ := client.GetQRChannel(context.Background())
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				w.Write([]byte(fmt.Sprintf("QR Code: %s\nScan with WhatsApp mobile app", evt.Code)))
+				return
+			}
+		}
+	})
 }
 
 func handleMessage(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
-		// Only process group messages
+		// Only process group messages that are not from us
 		if !v.Info.IsGroup || v.Info.IsFromMe {
 			return
 		}
@@ -90,6 +169,8 @@ func handleMessage(evt interface{}) {
 		if messageText == "" {
 			return
 		}
+		
+		log.Printf("📨 Message from %s in %s: %s", v.Info.PushName, v.Info.Chat, messageText)
 		
 		// Handle admin commands first
 		if matches := commandRegex.FindStringSubmatch(strings.TrimSpace(messageText)); matches != nil {
@@ -140,13 +221,13 @@ Example: \`ayam bakar 50000\`
 		response = fmt.Sprintf(`🤖 *Bot Status*
 
 ✅ Status: Online
-🕒 Uptime: %s
+🕒 Time: %s
 📡 Webhook: %s
 🤖 LLM: %s
-📊 Groups Active: Processing
+📊 Ready to track expenses!
 
-*Ready to track expenses!* 💰`, 
-			time.Since(time.Now().Add(-time.Hour)).String(),
+*Send messages like:* \`nasi gudeg 25000\` 💰`, 
+			time.Now().Format("15:04 MST"),
 			maskURL(n8nWebhookURL),
 			llmProvider)
 
@@ -165,7 +246,6 @@ Example: \`ayam bakar 50000\`
 *Categories are auto-assigned by AI* 🤖`
 
 	case "summary":
-		// This would typically query the spreadsheet for summary
 		response = `📊 *Monthly Summary*
 
 Coming soon! This will show:
@@ -180,7 +260,7 @@ For now, check your Google Sheet directly! 📋`
 		response = "❓ Unknown command. Type `/help` for available commands."
 	}
 	
-	whatsapp.SendMessage(msg.Info.Chat, response)
+	sendMessage(msg.Info.Chat, response)
 }
 
 func processExpenseMessage(msg *events.Message, item string, amountStr string) {
@@ -191,22 +271,15 @@ func processExpenseMessage(msg *events.Message, item string, amountStr string) {
 	amount, err := strconv.ParseFloat(amountStr, 64)
 	if err != nil {
 		log.Printf("❌ Failed to parse amount: %s", amountStr)
-		whatsapp.SendMessage(msg.Info.Chat, "❌ Invalid amount format. Use numbers only (e.g., 50000)")
+		sendMessage(msg.Info.Chat, "❌ Invalid amount format. Use numbers only (e.g., 50000)")
 		return
 	}
 	
 	// Get group info
-	groupInfo, err := whatsapp.GetGroupInfo(msg.Info.Chat)
+	groupInfo, err := getGroupInfo(msg.Info.Chat)
 	if err != nil {
 		log.Printf("❌ Failed to get group info: %v", err)
-		return
-	}
-	
-	// Get sender info
-	senderInfo, err := whatsapp.GetContactInfo(msg.Info.Sender)
-	if err != nil {
-		log.Printf("❌ Failed to get sender info: %v", err)
-		return
+		groupInfo = &GroupInfo{Name: "Unknown Group"}
 	}
 	
 	// Quick categorization first, then LLM if needed
@@ -220,7 +293,7 @@ func processExpenseMessage(msg *events.Message, item string, amountStr string) {
 		Amount:      amount,
 		Category:    category,
 		GroupName:   groupInfo.Name,
-		SenderName:  senderInfo.PushName,
+		SenderName:  msg.Info.PushName,
 		SenderPhone: msg.Info.Sender.User,
 		Timestamp:   msg.Info.Timestamp,
 		MessageID:   msg.Info.ID,
@@ -229,7 +302,7 @@ func processExpenseMessage(msg *events.Message, item string, amountStr string) {
 	// Send to n8n webhook
 	if err := sendToN8N(expenseData); err != nil {
 		log.Printf("❌ Failed to send to n8n: %v", err)
-		whatsapp.SendMessage(msg.Info.Chat, "❌ Failed to record expense. Please try again.")
+		sendMessage(msg.Info.Chat, "❌ Failed to record expense. Please try again.")
 		return
 	}
 	
@@ -248,7 +321,7 @@ _Saved to %s expenses_ 📊`,
 		expenseData.SenderName,
 		expenseData.GroupName)
 	
-	whatsapp.SendMessage(msg.Info.Chat, confirmationMsg)
+	sendMessage(msg.Info.Chat, confirmationMsg)
 	
 	log.Printf("✅ Expense processed: %s | %s | %.0f | %s", 
 		expenseData.GroupName, expenseData.Item, expenseData.Amount, expenseData.Category)
@@ -306,7 +379,7 @@ Reply with only the category name.`, item)
 	}
 	
 	jsonData, _ := json.Marshal(requestBody)
-	client := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
 	
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -317,7 +390,7 @@ Reply with only the category name.`, item)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+llmAPIKey)
 	
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("❌ LLM API call failed: %v", err)
 		return "Other"
@@ -357,8 +430,8 @@ func sendToN8N(data ExpenseData) error {
 		return fmt.Errorf("failed to marshal data: %v", err)
 	}
 	
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(n8nWebhookURL, "application/json", bytes.NewBuffer(jsonData))
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Post(n8nWebhookURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %v", err)
 	}
@@ -368,11 +441,29 @@ func sendToN8N(data ExpenseData) error {
 		return fmt.Errorf("webhook returned status: %d", resp.StatusCode)
 	}
 	
+	log.Printf("✅ Data sent to N8N successfully")
 	return nil
 }
 
+func sendMessage(chatID types.JID, message string) {
+	if client == nil {
+		log.Printf("❌ WhatsApp client not initialized")
+		return
+	}
+
+	msg := &waE2E.Message{
+		Conversation: proto.String(message),
+	}
+
+	_, err := client.SendMessage(context.Background(), chatID, msg)
+	if err != nil {
+		log.Printf("❌ Failed to send message: %v", err)
+	} else {
+		log.Printf("✅ Message sent to %s", chatID)
+	}
+}
+
 func formatCurrency(amount float64) string {
-	// Format Indonesian Rupiah
 	return fmt.Sprintf("%,.0f", amount)
 }
 
@@ -381,4 +472,21 @@ func maskURL(url string) string {
 		return url[:30] + "..." + url[len(url)-10:]
 	}
 	return url
+}
+
+type GroupInfo struct {
+	Name string
+}
+
+func getGroupInfo(chatID types.JID) (*GroupInfo, error) {
+	if client == nil {
+		return nil, fmt.Errorf("client not initialized")
+	}
+
+	groupInfo, err := client.GetGroupInfo(chatID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &GroupInfo{Name: groupInfo.Name}, nil
 }
